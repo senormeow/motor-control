@@ -94,8 +94,11 @@ fn main() -> ! {
 
         counter += 1;
 
-        let angle = read_angle(&mut i2c);
-        info!("Motor angle: {:?} degrees", angle);
+        // Try to read angle, but don't panic if it fails
+        match read_angle(&mut i2c) {
+            Ok(angle) => info!("Motor angle: {} degrees", angle),
+            Err(_) => info!("Failed to read angle - no device connected"),
+        }
 
         // Add a breakpoint condition every 10 iterations
         if counter % 10 == 0 {
@@ -104,10 +107,10 @@ fn main() -> ! {
     }
 }
 
-fn read_angle<T: I2c>(i2c: &mut T) -> f32 {
+fn read_angle<T: I2c>(i2c: &mut T) -> Result<f32, T::Error> {
     let mut buf = [0u8; 2];
-    i2c.write_read(0x36u8, &[0x0E], &mut buf).unwrap();
+    i2c.write_read(0x36u8, &[0x0E], &mut buf)?;
     let angle_u16 = ((buf[0] as u16) << 8) | (buf[1] as u16);
-    angle_u16 as f32 / 4096.0 * 360.0
+    Ok(angle_u16 as f32 / 4096.0 * 360.0)
 }
 // End of file

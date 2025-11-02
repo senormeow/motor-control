@@ -11,14 +11,14 @@
             "chip": "rp2040",
             // RP2040 doesn't support connectUnderReset
             "connectUnderReset": false,
-            "speed": 4000,
+            "speed": 1000,
             "runtimeExecutable": "probe-rs",
             "runtimeArgs": [
                 "dap-server"
             ],
             "flashingConfig": {
                 "flashingEnabled": true,
-                "haltAfterReset": false,
+                "haltAfterReset": true,
                 "restoreUnwrittenBytes": false
             },
             "coreConfigs": [
