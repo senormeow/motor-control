@@ -10,6 +10,7 @@ use defmt_rtt as _;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 use embedded_hal::i2c::I2c; // Import the I2c trait for write_read
+use embedded_hal::pwm::SetDutyCycle;
 use panic_probe as _;
 
 // Provide an alias for our BSP so we can switch targets quickly.
@@ -25,8 +26,6 @@ use hal::{
     sio::Sio,
     watchdog::Watchdog,
 };
-
-use hal::Timer;
 
 use hal::fugit::RateExtU32;
 
@@ -71,6 +70,13 @@ fn main() -> ! {
 
     let mut enable = pins.gpio8.into_push_pull_output();
     enable.set_low().unwrap();
+
+    let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
+    let pwm_a = &mut pwm_slices.pwm1;
+    pwm_a.set_ph_correct();
+    let channel_a = &mut pwm_a.channel_a;
+    let _ = channel_a.set_duty_cycle(0);
+    channel_a.output_to(pins.gpio2);
 
     let sda_pin: Pin<_, FunctionI2C, _> = pins.gpio20.reconfigure();
     let scl_pin: Pin<_, FunctionI2C, _> = pins.gpio21.reconfigure();
