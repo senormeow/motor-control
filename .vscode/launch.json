@@ -3,6 +3,50 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "GDB Session",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceRoot}/target/thumbv6m-none-eabi/debug/motor-control",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb-multiarch",
+            "miDebuggerServerAddress": "localhost:1337",
+            "miDebuggerArgs": "-iex set auto-solib-add 0",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set target architecture to ARM",
+                    "text": "set architecture arm", // Explicitly set architecture
+                    "ignoreFailures": false
+                }
+            ]
+        },
+        {
+            "name": "Debug Cortex",
+            "cwd": "${workspaceRoot}",
+            "executable": "${workspaceRoot}/target/thumbv6m-none-eabi/debug/motor-control",
+            "request": "launch",
+            "type": "cortex-debug",
+            "servertype": "external",
+            "toolchainPrefix": "arm-none-eabi",
+            //"gdbPath": "gdb-multiarch",
+            "gdbTarget": "localhost:1337",
+            "device": "rp2040",
+            //"runToEntryPoint": "main",
+            //"svdFile": "${workspaceRoot}/svd/TM4C123GH6PM.svd",
+            //"configFiles": [
+            //    "board/ek-tm4c123gxl.cfg"
+            //],
+            "postLaunchCommands": [
+                "break main",
+                "continue"
+            ]
+        },
+        {
             "preLaunchTask": "rust: cargo build",
             "type": "probe-rs-debug",
             "request": "launch",
@@ -11,7 +55,7 @@
             "chip": "rp2040",
             // RP2040 doesn't support connectUnderReset
             "connectUnderReset": false,
-            "speed": 1000,
+            "speed": 4000,
             "runtimeExecutable": "probe-rs",
             "runtimeArgs": [
                 "dap-server"
@@ -34,6 +78,34 @@
             ],
             "consoleLogLevel": "Debug", //Error, Warn, Info, Debug
             "wireProtocol": "Swd"
+        },
+        {
+            "type": "probe-rs-debug",
+            "request": "attach",
+            "name": "probe_rs Executable launch example",
+            "cwd": "${workspaceFolder}",
+            //!MODIFY (or remove)
+            "speed": 24000,
+            //!MODIFY
+            "chip": "RP2040",
+            //!MODIFY (or remove)
+            //"probe": "VID:PID:<Serial>",
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    //!MODIFY
+                    "programBinary": "target/thumbv6m-none-eabi/debug/motor-control",
+                    //!MODIFY
+                    //"svdFile": "Relative or fully qualified path to the CMSIS-SVD file for your target core"
+                }
+            ],
+            "env": {
+                //!MODIFY (or remove)
+                // If you set this variable, check the VSCode console log window for the location of the log file.
+                "RUST_LOG": "info"
+            },
+            // Info, Debug
+            "consoleLogLevel": "Console"
         }
     ]
 }

@@ -7,7 +7,8 @@
 use bsp::entry;
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::digital::OutputPin;
+use embedded_hal::delay::DelayNs;
+use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 use embedded_hal::i2c::I2c; // Import the I2c trait for write_read
 use panic_probe as _;
 
@@ -25,9 +26,15 @@ use hal::{
     watchdog::Watchdog,
 };
 
+use hal::Timer;
+
 use hal::fugit::RateExtU32;
 
 #[entry]
+fn _start() -> ! {
+    main()
+}
+
 fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
@@ -49,7 +56,9 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let _delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+
+    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
@@ -81,28 +90,38 @@ fn main() -> ! {
     // Initialize a counter for debugging
     let mut counter = 0u32;
 
+    let mut start = timer.get_counter().ticks();
+
+    let mut last_angle: f32 = 0.0;
+    let mut current_angle: f32;
+
+    let _angle = read_angle(&mut i2c).unwrap();
+    info!("Sensor OK");
+
     loop {
-        info!("Loop iteration: {}", counter);
+        let current = timer.get_counter().ticks();
 
-        info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-
-        info!("off!");
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
-
-        counter += 1;
-
-        // Try to read angle, but don't panic if it fails
-        match read_angle(&mut i2c) {
-            Ok(angle) => info!("Motor angle: {} degrees", angle),
-            Err(_) => info!("Failed to read angle - no device connected"),
+        if current.wrapping_sub(start) > 1_000_000 {
+            start = current;
+            info!("Current Time {}", current);
+            led_pin.toggle().unwrap();
+            info!("LED Toggle!");
+            counter += 1;
+            info!("Reached iteration {}", counter);
         }
 
-        // Add a breakpoint condition every 10 iterations
-        if counter % 10 == 0 {
-            info!("Reached iteration {}", counter);
+        match read_angle(&mut i2c) {
+            Ok(angle) => {
+                current_angle = angle;
+                if (last_angle - current_angle).abs() > 0.5 {
+                    info!("Motor angle: {}", current_angle);
+                    last_angle = current_angle;
+                }
+            }
+            Err(_) => {
+                info!("I2C read error occurred");
+                // Continue with last known angle or handle error as needed
+            }
         }
     }
 }
