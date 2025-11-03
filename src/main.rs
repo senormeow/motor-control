@@ -5,12 +5,13 @@
 #![no_main]
 
 use bsp::entry;
+use core::f32::consts::PI;
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 use embedded_hal::i2c::I2c; // Import the I2c trait for write_read
 use embedded_hal::pwm::SetDutyCycle;
+use libm::sinf;
 use panic_probe as _;
 
 // Provide an alias for our BSP so we can switch targets quickly.
@@ -72,11 +73,26 @@ fn main() -> ! {
     enable.set_low().unwrap();
 
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
+
     let pwm_a = &mut pwm_slices.pwm1;
     pwm_a.set_ph_correct();
+    pwm_a.set_div_int(10); // Set integer divisor
+    pwm_a.set_div_frac(0); // Set fractional divisor
+    pwm_a.enable();
     let channel_a = &mut pwm_a.channel_a;
-    let _ = channel_a.set_duty_cycle(0);
     channel_a.output_to(pins.gpio2);
+
+    let pwm_b = &mut pwm_slices.pwm2;
+    pwm_b.set_ph_correct();
+    pwm_b.enable();
+    let channel_b = &mut pwm_b.channel_a;
+    channel_b.output_to(pins.gpio4);
+
+    let pwm_c = &mut pwm_slices.pwm3;
+    pwm_c.set_ph_correct();
+    pwm_c.enable();
+    let channel_c = &mut pwm_c.channel_a;
+    channel_c.output_to(pins.gpio6);
 
     let sda_pin: Pin<_, FunctionI2C, _> = pins.gpio20.reconfigure();
     let scl_pin: Pin<_, FunctionI2C, _> = pins.gpio21.reconfigure();
@@ -103,6 +119,24 @@ fn main() -> ! {
 
     let _angle = read_angle(&mut i2c).unwrap();
     info!("Sensor OK");
+
+    set_angle(80.0, 90.0, channel_a, channel_b, channel_c);
+
+    // for d in 0..360 {
+    //     set_angle(80.0, d as f32, channel_a, channel_b, channel_c);
+    // }
+
+    // PWM configuration values
+    let div_int = 10u8;
+    let div_frac = 0u8;
+
+    info!(
+        "PWM config - Top: {}, Div_int: {}, Div_frac: {}, Calculated freq: {} Hz",
+        pwm_a.get_top(),
+        div_int,
+        div_frac,
+        clocks.system_clock.freq().to_Hz() / (div_int as u32) / (pwm_a.get_top() as u32 + 1)
+    );
 
     loop {
         let current = timer.get_counter().ticks();
@@ -139,3 +173,22 @@ fn read_angle<T: I2c>(i2c: &mut T) -> Result<f32, T::Error> {
     Ok(angle_u16 as f32 / 4096.0 * 360.0)
 }
 // End of file
+
+fn set_angle<A, B, C>(power: f32, angle: f32, ch_a: &mut A, ch_b: &mut B, ch_c: &mut C)
+where
+    A: SetDutyCycle,
+    C: SetDutyCycle,
+    B: SetDutyCycle,
+{
+    let angle_rad = angle.to_radians();
+
+    let duty_a = (32767.5 + (power / 100.0) * sinf(angle_rad) * 32767.5) as u16;
+    let duty_b = (32767.5 + (power / 100.0) * sinf(angle_rad - (2.0 * PI / 3.0)) * 32767.5) as u16;
+    let duty_c = (32767.5 + (power / 100.0) * sinf(angle_rad + (2.0 * PI / 3.0)) * 32767.5) as u16;
+
+    // ch_a.set_duty_cycle(duty_a).unwrap();
+    // ch_b.set_duty_cycle(duty_b).unwrap();
+    // ch_c.set_duty_cycle(duty_c).unwrap();
+
+    info!("duty a {}, duty b {}, duty c {}", duty_a, duty_b, duty_c);
+}
