@@ -8,6 +8,7 @@ use bsp::entry;
 use core::f32::consts::PI;
 use defmt::*;
 use defmt_rtt as _;
+use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 use embedded_hal::i2c::I2c; // Import the I2c trait for write_read
 use embedded_hal::pwm::SetDutyCycle;
@@ -29,6 +30,8 @@ use hal::{
 };
 
 use hal::fugit::RateExtU32;
+
+const TOP_VALUE: u16 = 4095;
 
 #[entry]
 fn _start() -> ! {
@@ -56,7 +59,7 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let _delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
@@ -72,24 +75,28 @@ fn main() -> ! {
     let mut enable = pins.gpio8.into_push_pull_output();
     enable.set_low().unwrap();
 
+    let div_int = pac.PWM.ch(0).div().read().int().bits();
+    let div_frac = pac.PWM.ch(0).div().read().frac().bits();
+
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
 
     let pwm_a = &mut pwm_slices.pwm1;
     pwm_a.set_ph_correct();
-    pwm_a.set_div_int(10); // Set integer divisor
-    pwm_a.set_div_frac(0); // Set fractional divisor
+    pwm_a.set_top(TOP_VALUE);
     pwm_a.enable();
     let channel_a = &mut pwm_a.channel_a;
     channel_a.output_to(pins.gpio2);
 
     let pwm_b = &mut pwm_slices.pwm2;
     pwm_b.set_ph_correct();
+    pwm_b.set_top(TOP_VALUE);
     pwm_b.enable();
     let channel_b = &mut pwm_b.channel_a;
     channel_b.output_to(pins.gpio4);
 
     let pwm_c = &mut pwm_slices.pwm3;
     pwm_c.set_ph_correct();
+    pwm_c.set_top(TOP_VALUE);
     pwm_c.enable();
     let channel_c = &mut pwm_c.channel_a;
     channel_c.output_to(pins.gpio6);
@@ -117,27 +124,23 @@ fn main() -> ! {
     let mut last_angle: f32 = 0.0;
     let mut current_angle: f32;
 
+    //set_angle(30.0, 90.0, channel_a, channel_b, channel_c);
+
+    enable.set_high().unwrap();
+    info!("Running");
+    // Step the angle by 5 degrees up to and including 7*360 (2520)
+    for d in (0..=(360 * 7)).step_by(5) {
+        set_angle(80.0, d as f32, channel_a, channel_b, channel_c);
+        delay.delay_us(1000);
+    }
+    set_angle(90.0, 0 as f32, channel_a, channel_b, channel_c);
+    delay.delay_ms(4);
+    enable.set_low().unwrap();
+    info!("stopped");
+    // PWM configuration values
+
     let _angle = read_angle(&mut i2c).unwrap();
     info!("Sensor OK");
-
-    set_angle(80.0, 90.0, channel_a, channel_b, channel_c);
-
-    // for d in 0..360 {
-    //     set_angle(80.0, d as f32, channel_a, channel_b, channel_c);
-    // }
-
-    // PWM configuration values
-    let div_int = 10u8;
-    let div_frac = 0u8;
-
-    info!(
-        "PWM config - Top: {}, Div_int: {}, Div_frac: {}, Calculated freq: {} Hz",
-        pwm_a.get_top(),
-        div_int,
-        div_frac,
-        clocks.system_clock.freq().to_Hz() / (div_int as u32) / (pwm_a.get_top() as u32 + 1)
-    );
-
     loop {
         let current = timer.get_counter().ticks();
 
@@ -182,13 +185,17 @@ where
 {
     let angle_rad = angle.to_radians();
 
-    let duty_a = (32767.5 + (power / 100.0) * sinf(angle_rad) * 32767.5) as u16;
-    let duty_b = (32767.5 + (power / 100.0) * sinf(angle_rad - (2.0 * PI / 3.0)) * 32767.5) as u16;
-    let duty_c = (32767.5 + (power / 100.0) * sinf(angle_rad + (2.0 * PI / 3.0)) * 32767.5) as u16;
+    let duty_scale = (TOP_VALUE as f32) / 2.0;
 
-    // ch_a.set_duty_cycle(duty_a).unwrap();
-    // ch_b.set_duty_cycle(duty_b).unwrap();
-    // ch_c.set_duty_cycle(duty_c).unwrap();
+    let duty_a = (duty_scale + (power / 100.0) * sinf(angle_rad) * duty_scale) as u16;
+    let duty_b =
+        (duty_scale + (power / 100.0) * sinf(angle_rad - (2.0 * PI / 3.0)) * duty_scale) as u16;
+    let duty_c =
+        (duty_scale + (power / 100.0) * sinf(angle_rad + (2.0 * PI / 3.0)) * duty_scale) as u16;
 
-    info!("duty a {}, duty b {}, duty c {}", duty_a, duty_b, duty_c);
+    ch_a.set_duty_cycle(duty_a).unwrap();
+    ch_b.set_duty_cycle(duty_b).unwrap();
+    ch_c.set_duty_cycle(duty_c).unwrap();
+
+    //info!("duty a {}, duty b {}, duty c {}", duty_a, duty_b, duty_c);
 }
