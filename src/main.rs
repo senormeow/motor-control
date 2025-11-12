@@ -6,6 +6,7 @@
 
 use bsp::entry;
 use core::f32::consts::PI;
+use cortex_m::prelude::_embedded_hal_adc_OneShot;
 use defmt::*;
 use defmt_rtt as _;
 use embedded_hal::delay::DelayNs;
@@ -13,6 +14,7 @@ use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 use embedded_hal::i2c::I2c; // Import the I2c trait for write_read
 use embedded_hal::pwm::SetDutyCycle;
 use libm::sinf;
+
 use panic_probe as _;
 
 // Provide an alias for our BSP so we can switch targets quickly.
@@ -75,8 +77,12 @@ fn main() -> ! {
     let mut enable = pins.gpio8.into_push_pull_output();
     enable.set_low().unwrap();
 
-    let div_int = pac.PWM.ch(0).div().read().int().bits();
-    let div_frac = pac.PWM.ch(0).div().read().frac().bits();
+    //Setup ADC
+    let mut adc = hal::Adc::new(pac.ADC, &mut pac.RESETS);
+    let mut adc_pin_0 = hal::adc::AdcPin::new(pins.gpio26).unwrap();
+    let mut adc_pin_1 = hal::adc::AdcPin::new(pins.gpio27).unwrap();
+
+    //Setup PWM
 
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
 
@@ -128,10 +134,15 @@ fn main() -> ! {
 
     enable.set_high().unwrap();
     info!("Running");
+    let mut a0: u16 = 0;
+    let mut a1: u16 = 0;
     // Step the angle by 5 degrees up to and including 7*360 (2520)
     for d in (0..=(360 * 7)).step_by(5) {
         set_angle(80.0, d as f32, channel_a, channel_b, channel_c);
-        delay.delay_us(1000);
+        a0 = adc.read(&mut adc_pin_0).unwrap();
+        a1 = adc.read(&mut adc_pin_0).unwrap();
+        info!("ADC0: {} ADC1: {}", a0, a1);
+        delay.delay_us(5000);
     }
     set_angle(90.0, 0 as f32, channel_a, channel_b, channel_c);
     delay.delay_ms(4);
