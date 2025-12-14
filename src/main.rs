@@ -33,6 +33,10 @@ use hal::{
 
 use hal::fugit::RateExtU32;
 
+mod current_sensor;
+
+use current_sensor::CurrentSensor;
+
 const TOP_VALUE: u16 = 4095;
 
 #[entry]
@@ -78,9 +82,11 @@ fn main() -> ! {
     enable.set_low().unwrap();
 
     //Setup ADC
-    let mut adc = hal::Adc::new(pac.ADC, &mut pac.RESETS);
-    let mut adc_pin_0 = hal::adc::AdcPin::new(pins.gpio26).unwrap();
-    let mut adc_pin_1 = hal::adc::AdcPin::new(pins.gpio27).unwrap();
+    let adc = hal::Adc::new(pac.ADC, &mut pac.RESETS);
+    let adc_pin_0 = hal::adc::AdcPin::new(pins.gpio26).unwrap();
+    let adc_pin_1 = hal::adc::AdcPin::new(pins.gpio27).unwrap();
+
+    let mut current_sensor = CurrentSensor::new(adc, adc_pin_0, adc_pin_1);
 
     //Setup PWM
 
@@ -123,26 +129,26 @@ fn main() -> ! {
     info!("I2C initialized successfully");
 
     // Initialize a counter for debugging
-    let mut counter = 0u32;
-
-    let mut start = timer.get_counter().ticks();
-
-    let mut last_angle: f32 = 0.0;
-    let mut current_angle: f32;
 
     //set_angle(30.0, 90.0, channel_a, channel_b, channel_c);
 
     enable.set_high().unwrap();
     info!("Running");
-    let mut a0: u16 = 0;
-    let mut a1: u16 = 0;
     // Step the angle by 5 degrees up to and including 7*360 (2520)
     for d in (0..=(360 * 7)).step_by(5) {
+        for j in (0..10) {
+            current_sensor.read();
+            current_sensor.display();
+            delay.delay_us(200);
+        }
+
         set_angle(80.0, d as f32, channel_a, channel_b, channel_c);
-        a0 = adc.read(&mut adc_pin_0).unwrap();
-        a1 = adc.read(&mut adc_pin_0).unwrap();
-        info!("ADC0: {} ADC1: {}", a0, a1);
-        delay.delay_us(5000);
+
+        for j in (0..10) {
+            current_sensor.read();
+            current_sensor.display();
+            delay.delay_us(200);
+        }
     }
     set_angle(90.0, 0 as f32, channel_a, channel_b, channel_c);
     delay.delay_ms(4);
@@ -150,12 +156,17 @@ fn main() -> ! {
     info!("stopped");
     // PWM configuration values
 
+    let mut counter = 0u32;
+    let mut start = timer.get_counter().ticks();
+    let mut last_angle: f32 = 0.0;
+    let mut current_angle: f32;
+
     let _angle = read_angle(&mut i2c).unwrap();
     info!("Sensor OK");
     loop {
         let current = timer.get_counter().ticks();
 
-        if current.wrapping_sub(start) > 1_000_000 {
+        if current.wrapping_sub(start) > 1_000_00 {
             start = current;
             info!("Current Time {}", current);
             led_pin.toggle().unwrap();
