@@ -14,6 +14,7 @@ use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 use embedded_hal::i2c::I2c; // Import the I2c trait for write_read
 use embedded_hal::pwm::SetDutyCycle;
 use libm::sinf;
+use rp_pico::pac::pwm::ch;
 
 use panic_probe as _;
 
@@ -37,7 +38,8 @@ mod current_sensor;
 
 use current_sensor::CurrentSensor;
 
-const TOP_VALUE: u16 = 4095;
+//const TOP_VALUE: u16 = 4095;
+const TOP_VALUE: u16 = 4094 * 4 - 1;
 
 #[entry]
 fn _start() -> ! {
@@ -97,21 +99,30 @@ fn main() -> ! {
     pwm_a.set_top(TOP_VALUE);
     pwm_a.enable();
     let channel_a = &mut pwm_a.channel_a;
+    let channel_an = &mut pwm_a.channel_b;
+    channel_an.set_inverted();
     channel_a.output_to(pins.gpio2);
+    channel_an.output_to(pins.gpio3);
 
     let pwm_b = &mut pwm_slices.pwm2;
     pwm_b.set_ph_correct();
     pwm_b.set_top(TOP_VALUE);
     pwm_b.enable();
     let channel_b = &mut pwm_b.channel_a;
+    let channel_bn = &mut pwm_b.channel_b;
+    channel_bn.set_inverted();
     channel_b.output_to(pins.gpio4);
+    channel_bn.output_to(pins.gpio5);
 
     let pwm_c = &mut pwm_slices.pwm3;
     pwm_c.set_ph_correct();
     pwm_c.set_top(TOP_VALUE);
     pwm_c.enable();
     let channel_c = &mut pwm_c.channel_a;
+    let channel_cn = &mut pwm_c.channel_b;
+    channel_cn.set_inverted();
     channel_c.output_to(pins.gpio6);
+    channel_cn.output_to(pins.gpio7);
 
     let sda_pin: Pin<_, FunctionI2C, _> = pins.gpio20.reconfigure();
     let scl_pin: Pin<_, FunctionI2C, _> = pins.gpio21.reconfigure();
@@ -134,61 +145,58 @@ fn main() -> ! {
 
     enable.set_high().unwrap();
     info!("Running");
-    // Step the angle by 5 degrees up to and including 7*360 (2520)
-    for d in (0..=(360 * 7)).step_by(5) {
-        for j in (0..10) {
-            current_sensor.read();
-            current_sensor.display();
-            delay.delay_us(200);
-        }
-
-        set_angle(80.0, d as f32, channel_a, channel_b, channel_c);
-
-        for j in (0..10) {
-            current_sensor.read();
-            current_sensor.display();
-            delay.delay_us(200);
-        }
-    }
-    set_angle(90.0, 0 as f32, channel_a, channel_b, channel_c);
-    delay.delay_ms(4);
-    enable.set_low().unwrap();
-    info!("stopped");
-    // PWM configuration values
-
-    let mut counter = 0u32;
-    let mut start = timer.get_counter().ticks();
-    let mut last_angle: f32 = 0.0;
-    let mut current_angle: f32;
-
-    let _angle = read_angle(&mut i2c).unwrap();
-    info!("Sensor OK");
     loop {
-        let current = timer.get_counter().ticks();
+        // Step the angle by 5 degrees up to and including 7*360 (2520)
+        for d in (0..=(360 * 2)).step_by(5) {
+            delay.delay_us(10000);
 
-        if current.wrapping_sub(start) > 1_000_00 {
-            start = current;
-            info!("Current Time {}", current);
-            led_pin.toggle().unwrap();
-            info!("LED Toggle!");
-            counter += 1;
-            info!("Reached iteration {}", counter);
-        }
-
-        match read_angle(&mut i2c) {
-            Ok(angle) => {
-                current_angle = angle;
-                if (last_angle - current_angle).abs() > 0.5 {
-                    info!("Motor angle: {}", current_angle);
-                    last_angle = current_angle;
-                }
-            }
-            Err(_) => {
-                info!("I2C read error occurred");
-                // Continue with last known angle or handle error as needed
-            }
+            set_angle(
+                80.0, d as f32, channel_a, channel_b, channel_c, channel_an, channel_bn, channel_cn,
+            );
         }
     }
+
+    // set_angle(
+    //     90.0, 0 as f32, channel_a, channel_b, channel_c, channel_an, channel_bn, channel_cn,
+    // );
+    // delay.delay_ms(4);
+    // enable.set_low().unwrap();
+    // info!("stopped");
+    // // PWM configuration values
+
+    // let mut counter = 0u32;
+    // let mut start = timer.get_counter().ticks();
+    // let mut last_angle: f32 = 0.0;
+    // let mut current_angle: f32;
+
+    // //let _angle = read_angle(&mut i2c).unwrap();
+    // info!("Sensor OK");
+    // loop {
+    //     let current = timer.get_counter().ticks();
+
+    //     if current.wrapping_sub(start) > 1_000_00 {
+    //         start = current;
+    //         info!("Current Time {}", current);
+    //         led_pin.toggle().unwrap();
+    //         info!("LED Toggle!");
+    //         counter += 1;
+    //         info!("Reached iteration {}", counter);
+    //     }
+
+    //     // match read_angle(&mut i2c) {
+    //     //     Ok(angle) => {
+    //     //         current_angle = angle;
+    //     //         if (last_angle - current_angle).abs() > 0.5 {
+    //     //             info!("Motor angle: {}", current_angle);
+    //     //             last_angle = current_angle;
+    //     //         }
+    //     //     }
+    //     //     Err(_) => {
+    //     //         info!("I2C read error occurred");
+    //     //         // Continue with last known angle or handle error as needed
+    //     //     }
+    //     // }
+    // }
 }
 
 fn read_angle<T: I2c>(i2c: &mut T) -> Result<f32, T::Error> {
@@ -199,11 +207,22 @@ fn read_angle<T: I2c>(i2c: &mut T) -> Result<f32, T::Error> {
 }
 // End of file
 
-fn set_angle<A, B, C>(power: f32, angle: f32, ch_a: &mut A, ch_b: &mut B, ch_c: &mut C)
-where
+fn set_angle<A, B, C, An, Bn, Cn>(
+    power: f32,
+    angle: f32,
+    ch_a: &mut A,
+    ch_b: &mut B,
+    ch_c: &mut C,
+    ch_an: &mut An,
+    ch_bn: &mut Bn,
+    ch_cn: &mut Cn,
+) where
     A: SetDutyCycle,
     C: SetDutyCycle,
     B: SetDutyCycle,
+    An: SetDutyCycle,
+    Bn: SetDutyCycle,
+    Cn: SetDutyCycle,
 {
     let angle_rad = angle.to_radians();
 
@@ -216,8 +235,10 @@ where
         (duty_scale + (power / 100.0) * sinf(angle_rad + (2.0 * PI / 3.0)) * duty_scale) as u16;
 
     ch_a.set_duty_cycle(duty_a).unwrap();
+    ch_an.set_duty_cycle(duty_a).unwrap();
     ch_b.set_duty_cycle(duty_b).unwrap();
+    ch_bn.set_duty_cycle(duty_b).unwrap();
     ch_c.set_duty_cycle(duty_c).unwrap();
-
+    ch_cn.set_duty_cycle(duty_c).unwrap();
     //info!("duty a {}, duty b {}, duty c {}", duty_a, duty_b, duty_c);
 }
