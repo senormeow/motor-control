@@ -2,6 +2,7 @@
 use cortex_m::prelude::_embedded_hal_adc_OneShot;
 use defmt::*;
 use defmt_rtt as _;
+use embedded_hal_0_2::adc::Channel;
 use rp_pico::hal::adc::Adc;
 use rp_pico::hal::adc::AdcPin;
 
@@ -18,8 +19,8 @@ impl<P0, P1> CurrentSensor<P0, P1>
 where
     P0: rp_pico::hal::gpio::AnyPin,
     P1: rp_pico::hal::gpio::AnyPin,
-    AdcPin<P0>: embedded_hal_0_2::adc::Channel<Adc, ID = u8>,
-    AdcPin<P1>: embedded_hal_0_2::adc::Channel<Adc, ID = u8>,
+    AdcPin<P0>: Channel<Adc, ID = u8>,
+    AdcPin<P1>: Channel<Adc, ID = u8>,
 {
     pub fn new(adc: Adc, adc_pin_0: AdcPin<P0>, adc_pin_1: AdcPin<P1>) -> Self {
         Self {

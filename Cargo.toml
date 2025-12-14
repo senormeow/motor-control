@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 embedded-hal = { version = "1.0.0" }
+embedded-hal-0-2 = { package = "embedded-hal", version = "0.2.7" }
 
 defmt = "1"
 defmt-rtt = "1"
