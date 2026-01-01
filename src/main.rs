@@ -40,6 +40,8 @@ use current_sensor::CurrentSensor;
 
 //const TOP_VALUE: u16 = 4095;
 const TOP_VALUE: u16 = 4094 * 4 - 1;
+// Deadtime in PWM ticks (e.g., 100 ticks ~ 0.8us at 125MHz system clock with divider 1)
+const DEADTIME_TICKS: u16 = 100;
 
 #[entry]
 fn _start() -> ! {
@@ -145,15 +147,25 @@ fn main() -> ! {
 
     enable.set_high().unwrap();
     info!("Running");
-    loop {
-        // Step the angle by 5 degrees up to and including 7*360 (2520)
-        for d in (0..=(360 * 2)).step_by(5) {
-            delay.delay_us(10000);
+    let mut angle: f32 = 0.0;
+    let angle_step: f32 = 1.0; // degrees per step (smaller = smoother)
+    let mut step_delay_us: u32 = 500; // microseconds between steps
 
-            set_angle(
-                80.0, d as f32, channel_a, channel_b, channel_c, channel_an, channel_bn, channel_cn,
-            );
+    loop {
+        set_angle(
+            60.0, angle, channel_a, channel_b, channel_c, channel_an, channel_bn, channel_cn,
+        );
+
+        angle += angle_step;
+        if angle >= 360.0 {
+            angle -= 360.0;
+            // Read current sensor once per electrical cycle
+            current_sensor.read();
+            current_sensor.display();
+            step_delay_us = current_sensor.get_a0() as u32 * 2; // Adjust speed based on current sensor reading
         }
+
+        delay.delay_us(step_delay_us);
     }
 
     // set_angle(
@@ -226,19 +238,41 @@ fn set_angle<A, B, C, An, Bn, Cn>(
 {
     let angle_rad = angle.to_radians();
 
-    let duty_scale = (TOP_VALUE as f32) / 2.0;
+    // Calculate three-phase sine values
+    let sin_a = sinf(angle_rad);
+    let sin_b = sinf(angle_rad - (2.0 * PI / 3.0));
+    let sin_c = sinf(angle_rad + (2.0 * PI / 3.0));
 
-    let duty_a = (duty_scale + (power / 100.0) * sinf(angle_rad) * duty_scale) as u16;
-    let duty_b =
-        (duty_scale + (power / 100.0) * sinf(angle_rad - (2.0 * PI / 3.0)) * duty_scale) as u16;
-    let duty_c =
-        (duty_scale + (power / 100.0) * sinf(angle_rad + (2.0 * PI / 3.0)) * duty_scale) as u16;
+    // Apply space vector modulation offset to increase voltage utilization
+    // This adds the average of min and max to center the waveform
+    let max_val = sin_a.max(sin_b).max(sin_c);
+    let min_val = sin_a.min(sin_b).min(sin_c);
+    let offset = -(max_val + min_val) / 2.0;
 
-    ch_a.set_duty_cycle(duty_a).unwrap();
-    ch_an.set_duty_cycle(duty_a).unwrap();
-    ch_b.set_duty_cycle(duty_b).unwrap();
-    ch_bn.set_duty_cycle(duty_b).unwrap();
-    ch_c.set_duty_cycle(duty_c).unwrap();
-    ch_cn.set_duty_cycle(duty_c).unwrap();
+    // Calculate duty cycle as percentage (0-100) with SVPWM
+    let duty_a_pct = 50.0 + (power / 100.0) * (sin_a + offset) * 50.0;
+    let duty_b_pct = 50.0 + (power / 100.0) * (sin_b + offset) * 50.0;
+    let duty_c_pct = 50.0 + (power / 100.0) * (sin_c + offset) * 50.0;
+
+    // Convert percentage to TOP_VALUE range
+    let duty_a = ((duty_a_pct / 100.0) * TOP_VALUE as f32) as u16;
+    let duty_b = ((duty_b_pct / 100.0) * TOP_VALUE as f32) as u16;
+    let duty_c = ((duty_c_pct / 100.0) * TOP_VALUE as f32) as u16;
+
+    // Apply deadtime: reduce high-side duty, increase low-side (inverted) duty
+    // This creates a gap where both sides are off
+    let duty_a_hs = duty_a.saturating_sub(DEADTIME_TICKS / 2);
+    let duty_a_ls = duty_a.saturating_add(DEADTIME_TICKS / 2).min(TOP_VALUE);
+    let duty_b_hs = duty_b.saturating_sub(DEADTIME_TICKS / 2);
+    let duty_b_ls = duty_b.saturating_add(DEADTIME_TICKS / 2).min(TOP_VALUE);
+    let duty_c_hs = duty_c.saturating_sub(DEADTIME_TICKS / 2);
+    let duty_c_ls = duty_c.saturating_add(DEADTIME_TICKS / 2).min(TOP_VALUE);
+
+    ch_a.set_duty_cycle(duty_a_hs).unwrap();
+    ch_an.set_duty_cycle(duty_a_ls).unwrap();
+    ch_b.set_duty_cycle(duty_b_hs).unwrap();
+    ch_bn.set_duty_cycle(duty_b_ls).unwrap();
+    ch_c.set_duty_cycle(duty_c_hs).unwrap();
+    ch_cn.set_duty_cycle(duty_c_ls).unwrap();
     //info!("duty a {}, duty b {}, duty c {}", duty_a, duty_b, duty_c);
 }

@@ -42,4 +42,8 @@ where
     pub fn display(&mut self) {
         info!("Adc0: {}, Adc1: {}", self.a0, self.a1);
     }
+
+    pub fn get_a0(&self) -> u16 {
+        self.a0
+    }
 }
