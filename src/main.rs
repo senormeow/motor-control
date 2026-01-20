@@ -397,8 +397,8 @@ fn main() -> ! {
         &mut pwm_c.channel_b,
         7,    // pole_pairs (adjust for your motor)
         1.0,  // voltage_limit (0.0-1.0) - max power
-        0.08, // velocity_p (proportional gain)
-        0.02, // velocity_i (integral gain)
+        0.10, // velocity_p (proportional gain) - increased for faster response
+        0.05, // velocity_i (integral gain) - increased to eliminate steady-state error
     );
 
     let sda_pin: Pin<_, FunctionI2C, _> = pins.gpio20.reconfigure();
@@ -415,6 +415,19 @@ fn main() -> ! {
 
     // Test I2C initialization
     info!("I2C initialized successfully");
+
+    // Configure AS5600 for high-speed operation
+    // CONF register (0x07-0x08):
+    //   Bits 0-1:   PM  = 00 (Normal power mode - lowest latency)
+    //   Bits 2-3:   HYST = 00 (Hysteresis OFF for best response)
+    //   Bits 4-5:   OUTS = 00 (Analog output 0-100%, not used)
+    //   Bits 6-7:   PWMF = 00 (PWM freq, not used)
+    //   Bits 8-9:   SF  = 11 (Slow filter 2x - fastest response)
+    //   Bits 10-12: FTH = 111 (Fast filter threshold - highest, enables fast filter)
+    //   Bit 13:     WD  = 0 (Watchdog OFF)
+    // High byte (0x07): bits 8-13 = 0b00_111_11 = 0x1F
+    // Low byte (0x08):  bits 0-7  = 0b00_00_00_00 = 0x00
+    configure_as5600(&mut i2c);
 
     // Enable motor driver
     enable.set_high().unwrap();
@@ -472,7 +485,45 @@ fn main() -> ! {
 
 fn read_angle<T: I2c>(i2c: &mut T) -> Result<f32, T::Error> {
     let mut buf = [0u8; 2];
-    i2c.write_read(0x36u8, &[0x0E], &mut buf)?;
+    // Read RAW_ANGLE (0x0C) instead of ANGLE (0x0E) - same data, but unaffected by ZPOS/MPOS
+    i2c.write_read(0x36u8, &[0x0C], &mut buf)?;
     let angle_u16 = ((buf[0] as u16) << 8) | (buf[1] as u16);
     Ok(angle_u16 as f32 / 4096.0 * 360.0)
+}
+
+/// Configure AS5600 for high-speed motor control
+/// Sets minimum filtering for fastest response time
+fn configure_as5600<T: I2c>(i2c: &mut T) {
+    // Read current CONF register
+    let mut buf = [0u8; 2];
+    if i2c.write_read(0x36u8, &[0x07], &mut buf).is_ok() {
+        info!("AS5600 CONF before: 0x{:02X}{:02X}", buf[0], buf[1]);
+    }
+
+    // Write new CONF register for high-speed operation:
+    // High byte (0x07): SF=11 (2x slow filter), FTH=111 (fast filter enabled at max threshold)
+    //   Bits 8-9:  SF  = 11 (2x - minimum slow filter)
+    //   Bits 10-12: FTH = 111 (fast filter threshold = max, ~21 LSB)
+    //   Bit 13:    WD  = 0 (watchdog off)
+    // = 0b0_111_11_xx where xx is part of PWMF from low byte = 0x1F when PWMF bits 6-7 = 0
+    let conf_high: u8 = 0b00011111; // SF=11, FTH=111, WD=0
+
+    // Low byte (0x08): PM=00, HYST=00, OUTS=00, PWMF bits 6-7 = 00
+    //   Bits 0-1: PM = 00 (normal power mode - fastest)
+    //   Bits 2-3: HYST = 00 (no hysteresis - best response)
+    //   Bits 4-5: OUTS = 00 (analog out 0-100%, ignored for I2C)
+    //   Bits 6-7: PWMF = 00 (115Hz PWM, ignored for I2C)
+    let conf_low: u8 = 0b00000000;
+
+    // Write CONF register (0x07 = high byte, 0x08 = low byte)
+    if i2c.write(0x36u8, &[0x07, conf_high, conf_low]).is_ok() {
+        info!("AS5600 configured for high-speed: SF=2x, FTH=max");
+    } else {
+        warn!("Failed to configure AS5600");
+    }
+
+    // Read back to verify
+    if i2c.write_read(0x36u8, &[0x07], &mut buf).is_ok() {
+        info!("AS5600 CONF after: 0x{:02X}{:02X}", buf[0], buf[1]);
+    }
 }
