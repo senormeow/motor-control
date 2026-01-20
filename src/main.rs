@@ -62,9 +62,19 @@ where
     // Open-loop control state
     shaft_angle: f32,
     open_loop_timestamp: u64,
+    // Closed-loop control state
+    prev_shaft_angle: f32,
+    shaft_velocity: f32,
+    velocity_integral: f32,
+    last_timestamp: u64,
+    fast_timestamp: u64,
+    last_voltage: f32,
     // Motor parameters
     pole_pairs: u8,
     voltage_limit: f32,
+    // PI controller gains
+    velocity_p: f32,
+    velocity_i: f32,
 }
 
 impl<A, B, C, An, Bn, Cn> Motor<A, B, C, An, Bn, Cn>
@@ -79,6 +89,8 @@ where
     /// Create a new Motor instance with all 6 PWM channels
     /// pole_pairs: number of motor pole pairs
     /// voltage_limit: maximum voltage (as duty cycle 0.0-1.0)
+    /// velocity_p: proportional gain for velocity PI controller
+    /// velocity_i: integral gain for velocity PI controller
     pub fn new(
         ch_a: A,
         ch_b: B,
@@ -88,6 +100,8 @@ where
         ch_cn: Cn,
         pole_pairs: u8,
         voltage_limit: f32,
+        velocity_p: f32,
+        velocity_i: f32,
     ) -> Self {
         Self {
             ch_a,
@@ -98,8 +112,16 @@ where
             ch_cn,
             shaft_angle: 0.0,
             open_loop_timestamp: 0,
+            prev_shaft_angle: 0.0,
+            shaft_velocity: 0.0,
+            velocity_integral: 0.0,
+            last_timestamp: 0,
+            fast_timestamp: 0,
+            last_voltage: 0.0,
             pole_pairs,
             voltage_limit,
+            velocity_p,
+            velocity_i,
         }
     }
 
@@ -180,6 +202,104 @@ where
         self.open_loop_timestamp = now_us;
 
         self.voltage_limit
+    }
+
+    /// Closed-loop velocity control with PI controller
+    /// target_velocity: target velocity in rad/s
+    /// shaft_angle_deg: current shaft angle from encoder in degrees
+    /// now_us: current timestamp in microseconds
+    /// Returns the applied voltage (duty cycle)
+    pub fn velocity_closedloop(
+        &mut self,
+        target_velocity: f32,
+        shaft_angle_deg: f32,
+        now_us: u64,
+    ) -> f32 {
+        // Convert shaft angle to radians
+        let shaft_angle_rad = shaft_angle_deg.to_radians();
+
+        // Calculate time delta
+        let dt_us = now_us.wrapping_sub(self.last_timestamp);
+        let mut dt = dt_us as f32 * 1e-6;
+
+        // Quick fix for strange cases (overflow + timestamp not defined)
+        if dt <= 0.0 || dt > 0.5 {
+            dt = 1e-3;
+        }
+
+        // Calculate angle difference (handle wraparound)
+        let mut angle_diff = shaft_angle_rad - self.prev_shaft_angle;
+        if angle_diff > PI {
+            angle_diff -= 2.0 * PI;
+        } else if angle_diff < -PI {
+            angle_diff += 2.0 * PI;
+        }
+
+        // Calculate actual velocity (lighter filtering for faster response)
+        let measured_velocity = angle_diff / dt;
+        self.shaft_velocity = 0.8 * self.shaft_velocity + 0.2 * measured_velocity;
+
+        // Velocity error
+        let velocity_error = target_velocity - self.shaft_velocity;
+
+        // PI controller
+        self.velocity_integral += velocity_error * dt;
+        // Anti-windup: clamp integral
+        self.velocity_integral = self.velocity_integral.clamp(
+            -1.0 / self.velocity_i.max(0.001),
+            1.0 / self.velocity_i.max(0.001),
+        );
+
+        let voltage = self.velocity_p * velocity_error + self.velocity_i * self.velocity_integral;
+        let voltage_clamped = voltage.clamp(-self.voltage_limit, self.voltage_limit);
+
+        // Predict angle forward to compensate for loop delay
+        // At high speeds, the rotor moves significantly during the loop time
+        let loop_delay_compensation = 0.0006; // ~600μs compensation
+        let predicted_angle = shaft_angle_rad + self.shaft_velocity * loop_delay_compensation;
+
+        // Calculate electrical angle from predicted mechanical angle
+        // Phase lead direction based on voltage sign (torque direction we want to apply)
+        // Negative sign because motor winding direction is reversed
+        let direction = if voltage_clamped >= 0.0 { -1.0 } else { 1.0 };
+        let electrical_angle = predicted_angle * self.pole_pairs as f32 + direction * PI / 2.0;
+
+        // Set phase voltage
+        self.set_angle(voltage_clamped.abs(), electrical_angle.to_degrees());
+
+        // Save state for next call
+        self.prev_shaft_angle = shaft_angle_rad;
+        self.last_timestamp = now_us;
+        self.fast_timestamp = now_us;
+        self.last_voltage = voltage_clamped;
+
+        voltage_clamped
+    }
+
+    /// Fast angle update using predicted angle (call between I2C reads)
+    /// Uses last measured velocity to extrapolate angle
+    pub fn update_angle_fast(&mut self, now_us: u64) {
+        // Calculate time since last fast update
+        let dt_us = now_us.wrapping_sub(self.fast_timestamp);
+        let dt = dt_us as f32 * 1e-6;
+
+        if dt <= 0.0 || dt > 0.01 {
+            self.fast_timestamp = now_us;
+            return; // Skip if time is invalid or too long
+        }
+
+        // Predict current angle using velocity (cumulative from prev_shaft_angle)
+        let time_since_measurement = (now_us.wrapping_sub(self.last_timestamp)) as f32 * 1e-6;
+        let predicted_angle = self.prev_shaft_angle + self.shaft_velocity * time_since_measurement;
+
+        // Calculate electrical angle
+        let direction = if self.last_voltage >= 0.0 { -1.0 } else { 1.0 };
+        let electrical_angle = predicted_angle * self.pole_pairs as f32 + direction * PI / 2.0;
+
+        // Update PWM with same voltage but predicted angle
+        self.set_angle(self.last_voltage.abs(), electrical_angle.to_degrees());
+
+        self.fast_timestamp = now_us;
     }
 }
 
@@ -276,8 +396,10 @@ fn main() -> ! {
         &mut pwm_a.channel_b,
         &mut pwm_b.channel_b,
         &mut pwm_c.channel_b,
-        7,   // pole_pairs (adjust for your motor)
-        0.8, // voltage_limit (0.0-1.0)
+        7,    // pole_pairs (adjust for your motor)
+        1.0,  // voltage_limit (0.0-1.0) - max power
+        0.2,  // velocity_p (proportional gain)
+        0.02, // velocity_i (integral gain)
     );
 
     let sda_pin: Pin<_, FunctionI2C, _> = pins.gpio20.reconfigure();
@@ -286,8 +408,8 @@ fn main() -> ! {
     let mut i2c = hal::I2C::i2c0(
         pac.I2C0,
         sda_pin,
-        scl_pin, // Try `not_an_scl_pin` here
-        400.kHz(),
+        scl_pin,
+        1000.kHz(), // Fast mode plus (1MHz) for faster angle reads
         &mut pac.RESETS,
         &clocks.system_clock,
     );
@@ -301,58 +423,48 @@ fn main() -> ! {
 
     enable.set_high().unwrap();
     info!("Running");
-    let target_velocity: f32 = 12.0; // rad/s (adjust as needed)
+    let target_velocity: f32 = 40.0;
 
-    //let mut start = timer.get_counter().ticks();
-    let mut last_angle: f32 = 0.0;
-    let mut current_angle: f32;
-    //let mut counter = 0u32;
+    let mut current_angle: f32 = 0.0;
+    let mut prev_angle: f32 = 0.0;
+    let mut debug_counter: u32 = 0;
+    let mut loop_counter: u32 = 0;
+    let mut last_debug_time: u64 = 0;
+
+    // Closed-loop velocity control
     loop {
-        let current = timer.get_counter().ticks();
-        motor.velocity_openloop(target_velocity, current);
+        let now_us = timer.get_counter().ticks();
+        loop_counter += 1;
+
+        // Read encoder every loop
         match read_angle(&mut i2c) {
             Ok(angle) => {
                 current_angle = angle;
-                if (last_angle - current_angle).abs() > 0.5 {
-                    info!("Motor angle: {}", current_angle);
-                    last_angle = current_angle;
-                }
             }
-            Err(_) => {
-                info!("I2C read error occurred");
-                // Continue with last known angle or handle error as needed
-            }
+            Err(_) => {}
+        }
+
+        // Run closed-loop velocity control
+        motor.velocity_closedloop(target_velocity, current_angle, now_us);
+
+        // Debug output every ~1000 loops
+        debug_counter += 1;
+        if debug_counter >= 1000 {
+            debug_counter = 0;
+
+            let elapsed_us = now_us.wrapping_sub(last_debug_time);
+            let elapsed_s = elapsed_us as f32 * 1e-6;
+
+            let velocity_error = target_velocity - motor.shaft_velocity;
+            let loop_rate_hz = (loop_counter as f32) / elapsed_s;
+            info!(
+                "vel: {}, err: {}, V: {}, loop_hz: {}",
+                motor.shaft_velocity, velocity_error, motor.last_voltage, loop_rate_hz
+            );
+            loop_counter = 0;
+            last_debug_time = now_us;
         }
     }
-
-    // //let _angle = read_angle(&mut i2c).unwrap();
-    // info!("Sensor OK");
-    // loop {
-    //     let current = timer.get_counter().ticks();
-
-    //     if current.wrapping_sub(start) > 1_000_00 {
-    //         start = current;
-    //         info!("Current Time {}", current);
-    //         led_pin.toggle().unwrap();
-    //         info!("LED Toggle!");
-    //         counter += 1;
-    //         info!("Reached iteration {}", counter);
-    //     }
-
-    //     // match read_angle(&mut i2c) {
-    //     //     Ok(angle) => {
-    //     //         current_angle = angle;
-    //     //         if (last_angle - current_angle).abs() > 0.5 {
-    //     //             info!("Motor angle: {}", current_angle);
-    //     //             last_angle = current_angle;
-    //     //         }
-    //     //     }
-    //     //     Err(_) => {
-    //     //         info!("I2C read error occurred");
-    //     //         // Continue with last known angle or handle error as needed
-    //     //     }
-    //     // }
-    // }
 }
 
 fn read_angle<T: I2c>(i2c: &mut T) -> Result<f32, T::Error> {
