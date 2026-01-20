@@ -72,6 +72,7 @@ where
     // Motor parameters
     pole_pairs: u8,
     voltage_limit: f32,
+    pub electrical_zero_offset: f32, // Electrical angle offset in radians
     // PI controller gains
     velocity_p: f32,
     velocity_i: f32,
@@ -120,9 +121,52 @@ where
             last_voltage: 0.0,
             pole_pairs,
             voltage_limit,
+            electrical_zero_offset: 0.0,
             velocity_p,
             velocity_i,
         }
+    }
+
+    /// Calibrate electrical zero offset
+    /// Applies voltage to align rotor with phase A (electrical angle 0),
+    /// then reads encoder to find the offset.
+    /// Returns the calibrated offset in radians.
+    ///
+    /// Call this with a closure that reads the encoder angle in degrees.
+    pub fn calibrate_electrical_zero<F, D>(&mut self, mut read_angle: F, mut delay: D) -> f32
+    where
+        F: FnMut() -> f32,
+        D: FnMut(u32),
+    {
+        // Disable motor first
+        self.set_pwm(0.0, 0.0, 0.0);
+        delay(100_000); // 100ms settle
+
+        // Apply moderate voltage at electrical angle 0 (aligned with phase A)
+        // This pulls the rotor to a known electrical position
+        let calibration_voltage = 0.3;
+        self.set_angle(calibration_voltage, 0.0);
+        delay(500_000); // 500ms for rotor to settle
+
+        // Read the mechanical angle
+        let mechanical_angle_deg = read_angle();
+        let mechanical_angle_rad = mechanical_angle_deg * PI / 180.0;
+
+        // Calculate what electrical angle the encoder thinks we're at
+        let measured_electrical_angle = mechanical_angle_rad * self.pole_pairs as f32;
+
+        // Normalize to one electrical period (0 to 2π)
+        let two_pi = 2.0 * PI;
+        let normalized_offset = ((measured_electrical_angle % two_pi) + two_pi) % two_pi;
+
+        // The offset tells us how much to ADD to get correct electrical angle
+        // (we measured electrical angle when we applied 0, so this is the correction)
+        self.electrical_zero_offset = normalized_offset;
+
+        // Disable motor after calibration
+        self.set_pwm(0.0, 0.0, 0.0);
+
+        self.electrical_zero_offset
     }
 
     /// Set the PWM duty cycles for all three phases with deadtime compensation
@@ -253,16 +297,20 @@ where
         let voltage = self.velocity_p * velocity_error + self.velocity_i * self.velocity_integral;
         let voltage_clamped = voltage.clamp(-self.voltage_limit, self.voltage_limit);
 
-        // Predict angle forward to compensate for loop delay
-        // At high speeds, the rotor moves significantly during the loop time
-        let loop_delay_compensation = 0.0006; // ~600μs compensation
-        let predicted_angle = shaft_angle_rad + self.shaft_velocity * loop_delay_compensation;
+        // No delay compensation at low speeds - only enable above threshold
+        let predicted_angle = if self.shaft_velocity.abs() > 25.0 {
+            let loop_delay_compensation = 0.0007; // ~700μs compensation
+            shaft_angle_rad + self.shaft_velocity * loop_delay_compensation
+        } else {
+            shaft_angle_rad
+        };
 
         // Calculate electrical angle from predicted mechanical angle
         // Phase lead direction based on voltage sign (torque direction we want to apply)
         // Negative sign because motor winding direction is reversed
         let direction = if voltage_clamped >= 0.0 { -1.0 } else { 1.0 };
         let electrical_angle = predicted_angle * self.pole_pairs as f32 + direction * PI / 2.0;
+        // Note: electrical_zero_offset calibration disabled for now
 
         // Set phase voltage
         self.set_angle(voltage_clamped.abs(), electrical_angle.to_degrees());
@@ -398,7 +446,7 @@ fn main() -> ! {
         &mut pwm_c.channel_b,
         7,    // pole_pairs (adjust for your motor)
         1.0,  // voltage_limit (0.0-1.0) - max power
-        0.2,  // velocity_p (proportional gain)
+        0.08, // velocity_p (proportional gain)
         0.02, // velocity_i (integral gain)
     );
 
@@ -417,16 +465,17 @@ fn main() -> ! {
     // Test I2C initialization
     info!("I2C initialized successfully");
 
-    // Initialize a counter for debugging
-
-    //set_angle(30.0, 90.0, channel_a, channel_b, channel_c);
-
+    // Enable motor driver
     enable.set_high().unwrap();
+
+    // Skip calibration for now - it needs more work
+    // The current commutation is working empirically without offset
+
     info!("Running");
-    let target_velocity: f32 = 40.0;
+    let target_velocity: f32 = 12.0;
 
     let mut current_angle: f32 = 0.0;
-    let mut prev_angle: f32 = 0.0;
+    let prev_angle: f32 = 0.0;
     let mut debug_counter: u32 = 0;
     let mut loop_counter: u32 = 0;
     let mut last_debug_time: u64 = 0;
