@@ -1,20 +1,18 @@
-//! Blinks the LED on a Pico board
+//! BLDC Motor Controller for RP Pico
 //!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
+//! Implements closed-loop velocity control using sinusoidal PWM commutation
+//! with AS5600 magnetic encoder feedback.
 #![no_std]
 #![no_main]
 
 use bsp::entry;
 use core::f32::consts::PI;
-use cortex_m::prelude::_embedded_hal_adc_OneShot;
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::{OutputPin, StatefulOutputPin};
-use embedded_hal::i2c::I2c; // Import the I2c trait for write_read
+use embedded_hal::digital::OutputPin;
+use embedded_hal::i2c::I2c;
 use embedded_hal::pwm::SetDutyCycle;
 use libm::sinf;
-use rp_pico::pac::pwm::ch;
 
 use panic_probe as _;
 
@@ -25,7 +23,7 @@ use rp_pico as bsp;
 
 use bsp::hal;
 use hal::{
-    clocks::{init_clocks_and_plls, Clock},
+    clocks::init_clocks_and_plls,
     gpio::{FunctionI2C, Pin},
     pac,
     sio::Sio,
@@ -72,7 +70,6 @@ where
     // Motor parameters
     pole_pairs: u8,
     voltage_limit: f32,
-    pub electrical_zero_offset: f32, // Electrical angle offset in radians
     // PI controller gains
     velocity_p: f32,
     velocity_i: f32,
@@ -121,52 +118,9 @@ where
             last_voltage: 0.0,
             pole_pairs,
             voltage_limit,
-            electrical_zero_offset: 0.0,
             velocity_p,
             velocity_i,
         }
-    }
-
-    /// Calibrate electrical zero offset
-    /// Applies voltage to align rotor with phase A (electrical angle 0),
-    /// then reads encoder to find the offset.
-    /// Returns the calibrated offset in radians.
-    ///
-    /// Call this with a closure that reads the encoder angle in degrees.
-    pub fn calibrate_electrical_zero<F, D>(&mut self, mut read_angle: F, mut delay: D) -> f32
-    where
-        F: FnMut() -> f32,
-        D: FnMut(u32),
-    {
-        // Disable motor first
-        self.set_pwm(0.0, 0.0, 0.0);
-        delay(100_000); // 100ms settle
-
-        // Apply moderate voltage at electrical angle 0 (aligned with phase A)
-        // This pulls the rotor to a known electrical position
-        let calibration_voltage = 0.3;
-        self.set_angle(calibration_voltage, 0.0);
-        delay(500_000); // 500ms for rotor to settle
-
-        // Read the mechanical angle
-        let mechanical_angle_deg = read_angle();
-        let mechanical_angle_rad = mechanical_angle_deg * PI / 180.0;
-
-        // Calculate what electrical angle the encoder thinks we're at
-        let measured_electrical_angle = mechanical_angle_rad * self.pole_pairs as f32;
-
-        // Normalize to one electrical period (0 to 2π)
-        let two_pi = 2.0 * PI;
-        let normalized_offset = ((measured_electrical_angle % two_pi) + two_pi) % two_pi;
-
-        // The offset tells us how much to ADD to get correct electrical angle
-        // (we measured electrical angle when we applied 0, so this is the correction)
-        self.electrical_zero_offset = normalized_offset;
-
-        // Disable motor after calibration
-        self.set_pwm(0.0, 0.0, 0.0);
-
-        self.electrical_zero_offset
     }
 
     /// Set the PWM duty cycles for all three phases with deadtime compensation
@@ -200,13 +154,13 @@ where
     pub fn set_angle(&mut self, power: f32, angle: f32) {
         let angle_rad = angle.to_radians();
 
-        // Calculate three-phase sine values
+        // Calculate three-phase sine values (a-c-b sequence)
         let sin_a = sinf(angle_rad);
         let sin_b = sinf(angle_rad - (2.0 * PI / 3.0));
         let sin_c = sinf(angle_rad + (2.0 * PI / 3.0));
 
         // Apply space vector modulation offset to increase voltage utilization
-        // This adds the average of min and max to center the waveform
+        // This adds the average of min and max to center the waveform (midpoint clamp)
         let max_val = sin_a.max(sin_b).max(sin_c);
         let min_val = sin_a.min(sin_b).min(sin_c);
         let offset = -(max_val + min_val) / 2.0;
@@ -310,9 +264,8 @@ where
         // Negative sign because motor winding direction is reversed
         let direction = if voltage_clamped >= 0.0 { -1.0 } else { 1.0 };
         let electrical_angle = predicted_angle * self.pole_pairs as f32 + direction * PI / 2.0;
-        // Note: electrical_zero_offset calibration disabled for now
 
-        // Set phase voltage
+        // Set phase voltage using absolute value
         self.set_angle(voltage_clamped.abs(), electrical_angle.to_degrees());
 
         // Save state for next call
@@ -368,7 +321,7 @@ fn _start() -> ! {
 fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
+    let _core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
@@ -386,8 +339,6 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
     let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
     let pins = bsp::Pins::new(
@@ -397,7 +348,7 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    let mut led_pin = pins.led.into_push_pull_output();
+    let _led_pin = pins.led.into_push_pull_output();
 
     let mut enable = pins.gpio8.into_push_pull_output();
     enable.set_low().unwrap();
@@ -468,14 +419,10 @@ fn main() -> ! {
     // Enable motor driver
     enable.set_high().unwrap();
 
-    // Skip calibration for now - it needs more work
-    // The current commutation is working empirically without offset
-
     info!("Running");
-    let target_velocity: f32 = 12.0;
+    let target_velocity: f32 = 40.0;
 
     let mut current_angle: f32 = 0.0;
-    let prev_angle: f32 = 0.0;
     let mut debug_counter: u32 = 0;
     let mut loop_counter: u32 = 0;
     let mut last_debug_time: u64 = 0;
@@ -493,6 +440,9 @@ fn main() -> ! {
             Err(_) => {}
         }
 
+        // Read current sensors
+        current_sensor.read();
+
         // Run closed-loop velocity control
         motor.velocity_closedloop(target_velocity, current_angle, now_us);
 
@@ -501,14 +451,18 @@ fn main() -> ! {
         if debug_counter >= 1000 {
             debug_counter = 0;
 
+            // Calculate RMS current from accumulated samples
+            current_sensor.calculate_rms();
+
             let elapsed_us = now_us.wrapping_sub(last_debug_time);
             let elapsed_s = elapsed_us as f32 * 1e-6;
 
-            let velocity_error = target_velocity - motor.shaft_velocity;
             let loop_rate_hz = (loop_counter as f32) / elapsed_s;
+            let rms_a = current_sensor.get_rms_a();
+            let rms_b = current_sensor.get_rms_b();
             info!(
-                "vel: {}, err: {}, V: {}, loop_hz: {}",
-                motor.shaft_velocity, velocity_error, motor.last_voltage, loop_rate_hz
+                "vel: {}, V: {}, Ia_rms: {}A, Ib_rms: {}A, hz: {}",
+                motor.shaft_velocity, motor.last_voltage, rms_a, rms_b, loop_rate_hz
             );
             loop_counter = 0;
             last_debug_time = now_us;
