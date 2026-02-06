@@ -36,10 +36,11 @@ mod current_sensor;
 
 use current_sensor::CurrentSensor;
 
-//const TOP_VALUE: u16 = 4095;
-const TOP_VALUE: u16 = 4094 - 1;
-// Deadtime in PWM ticks (e.g., 100 ticks ~ 0.8us at 125MHz system clock with divider 1)
-const DEADTIME_TICKS: u16 = 100;
+const TOP_VALUE: u16 = 4095;
+// Software deadtime as a fraction (0.0 to 1.0)
+// 0.025 = 2.5% of PWM period
+// Split between both edges for symmetric deadtime
+const DEAD_ZONE: f32 = 0.025;
 
 /// Motor controller struct that encapsulates all 6 PWM channels for 3-phase motor control
 pub struct Motor<A, B, C, An, Bn, Cn>
@@ -123,29 +124,41 @@ where
         }
     }
 
-    /// Set the PWM duty cycles for all three phases with deadtime compensation
+    /// Set the PWM duty cycles for all three phases with software deadtime
     /// duty_a, duty_b, duty_c should be floats between 0.0 and 1.0
+    ///
+    /// With hardware-inverted low-side and phase-correct PWM:
+    /// - High-side: ON when counter < CC (normal)
+    /// - Low-side:  ON when counter >= CC (inverted)
+    ///
+    /// For symmetric deadtime on both edges:
+    /// - High-side CC reduced (turns off earlier)
+    /// - Low-side CC increased (turns on later after inversion)
     pub fn set_pwm(&mut self, duty_a: f32, duty_b: f32, duty_c: f32) {
-        // Convert float (0.0-1.0) to u16 (0-TOP_VALUE)
-        let duty_a_raw = (duty_a.clamp(0.0, 1.0) * TOP_VALUE as f32) as u16;
-        let duty_b_raw = (duty_b.clamp(0.0, 1.0) * TOP_VALUE as f32) as u16;
-        let duty_c_raw = (duty_c.clamp(0.0, 1.0) * TOP_VALUE as f32) as u16;
+        // Clamp duty cycles to valid range
+        let duty_a = duty_a.clamp(DEAD_ZONE, 1.0 - DEAD_ZONE);
+        let duty_b = duty_b.clamp(DEAD_ZONE, 1.0 - DEAD_ZONE);
+        let duty_c = duty_c.clamp(DEAD_ZONE, 1.0 - DEAD_ZONE);
 
-        // Apply deadtime: reduce high-side duty, increase low-side (inverted) duty
-        // This creates a gap where both sides are off
-        let duty_a_hs = duty_a_raw.saturating_sub(DEADTIME_TICKS / 2);
-        let duty_a_ls = duty_a_raw.saturating_add(DEADTIME_TICKS / 2).min(TOP_VALUE);
-        let duty_b_hs = duty_b_raw.saturating_sub(DEADTIME_TICKS / 2);
-        let duty_b_ls = duty_b_raw.saturating_add(DEADTIME_TICKS / 2).min(TOP_VALUE);
-        let duty_c_hs = duty_c_raw.saturating_sub(DEADTIME_TICKS / 2);
-        let duty_c_ls = duty_c_raw.saturating_add(DEADTIME_TICKS / 2).min(TOP_VALUE);
+        // Half deadtime on each side for symmetric insertion
+        let half_dt = DEAD_ZONE / 2.0;
 
-        self.ch_a.set_duty_cycle(duty_a_hs).unwrap();
-        self.ch_an.set_duty_cycle(duty_a_ls).unwrap();
-        self.ch_b.set_duty_cycle(duty_b_hs).unwrap();
-        self.ch_bn.set_duty_cycle(duty_b_ls).unwrap();
-        self.ch_c.set_duty_cycle(duty_c_hs).unwrap();
-        self.ch_cn.set_duty_cycle(duty_c_ls).unwrap();
+        // High-side: reduce duty (turn off earlier)
+        let hs_a = ((duty_a - half_dt).max(0.0) * TOP_VALUE as f32) as u16;
+        let hs_b = ((duty_b - half_dt).max(0.0) * TOP_VALUE as f32) as u16;
+        let hs_c = ((duty_c - half_dt).max(0.0) * TOP_VALUE as f32) as u16;
+
+        // Low-side: increase duty (with inversion, turns on later)
+        let ls_a = ((duty_a + half_dt).min(1.0) * TOP_VALUE as f32) as u16;
+        let ls_b = ((duty_b + half_dt).min(1.0) * TOP_VALUE as f32) as u16;
+        let ls_c = ((duty_c + half_dt).min(1.0) * TOP_VALUE as f32) as u16;
+
+        self.ch_a.set_duty_cycle(hs_a).unwrap();
+        self.ch_an.set_duty_cycle(ls_a).unwrap();
+        self.ch_b.set_duty_cycle(hs_b).unwrap();
+        self.ch_bn.set_duty_cycle(ls_b).unwrap();
+        self.ch_c.set_duty_cycle(hs_c).unwrap();
+        self.ch_cn.set_duty_cycle(ls_c).unwrap();
     }
 
     /// Set motor angle using SVPWM (Space Vector PWM)
@@ -368,7 +381,7 @@ fn main() -> ! {
     pwm_a.set_ph_correct();
     pwm_a.set_top(TOP_VALUE);
     pwm_a.enable();
-    pwm_a.channel_b.set_inverted();
+    pwm_a.channel_b.set_inverted(); // Low-side is inverted for complementary operation
     pwm_a.channel_a.output_to(pins.gpio2);
     pwm_a.channel_b.output_to(pins.gpio3);
 
@@ -396,7 +409,7 @@ fn main() -> ! {
         &mut pwm_b.channel_b,
         &mut pwm_c.channel_b,
         7,    // pole_pairs (adjust for your motor)
-        1.0,  // voltage_limit (0.0-1.0) - max power
+        0.3,  // voltage_limit (0.0-1.0) - max power
         0.10, // velocity_p (proportional gain) - increased for faster response
         0.05, // velocity_i (integral gain) - increased to eliminate steady-state error
     );
@@ -427,25 +440,68 @@ fn main() -> ! {
     //   Bit 13:     WD  = 0 (Watchdog OFF)
     // High byte (0x07): bits 8-13 = 0b00_111_11 = 0x1F
     // Low byte (0x08):  bits 0-7  = 0b00_00_00_00 = 0x00
-    configure_as5600(&mut i2c);
+    //configure_as5600(&mut i2c);
 
     // Enable motor driver
     enable.set_high().unwrap();
 
-    info!("Running");
-    let target_velocity: f32 = 40.0;
+    info!("Running PWM TEST MODE");
+    info!("Testing each channel at 50% duty");
+    info!("GPIO2/3=Phase A, GPIO4/5=Phase B, GPIO6/7=Phase C");
+
+    // PWM Test Mode - cycles through each channel
+    // Check with scope:
+    //   - High-side should be ~50% duty
+    //   - Low-side should be inverted (complement) with deadtime gap
+    let test_duty: f32 = 0.5;
+    let mut test_phase: u8 = 0;
+    let mut test_counter: u32 = 0;
+
+    loop {
+        test_counter += 1;
+
+        // Change phase every ~2 seconds (adjust based on your loop speed)
+        if test_counter >= 2_000_000 {
+            test_counter = 0;
+            test_phase = (test_phase + 1) % 4;
+
+            match test_phase {
+                0 => {
+                    info!("Testing Phase A (GPIO2=HS, GPIO3=LS)");
+                    motor.set_pwm(test_duty, 0.5, 0.5); // Only A active
+                }
+                1 => {
+                    info!("Testing Phase B (GPIO4=HS, GPIO5=LS)");
+                    motor.set_pwm(0.5, test_duty, 0.5);
+                }
+                2 => {
+                    info!("Testing Phase C (GPIO6=HS, GPIO7=LS)");
+                    motor.set_pwm(0.5, 0.5, test_duty);
+                }
+                3 => {
+                    info!("All phases at 50%");
+                    motor.set_pwm(test_duty, test_duty, test_duty);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /* ORIGINAL MOTOR CONTROL CODE - uncomment when done testing
+    let target_velocity: f32 = 20.0;
 
     let mut current_angle: f32 = 0.0;
     let mut debug_counter: u32 = 0;
     let mut loop_counter: u32 = 0;
     let mut last_debug_time: u64 = 0;
 
+    info!("Target Velocity {}", target_velocity);
     // Closed-loop velocity control
     loop {
         let now_us = timer.get_counter().ticks();
         loop_counter += 1;
 
-        // Read encoder every loop
+        //Read encoder every loop
         match read_angle(&mut i2c) {
             Ok(angle) => {
                 current_angle = angle;
@@ -454,10 +510,13 @@ fn main() -> ! {
         }
 
         // Read current sensors
-        current_sensor.read();
+        //current_sensor.read();
 
         // Run closed-loop velocity control
-        motor.velocity_closedloop(target_velocity, current_angle, now_us);
+        //motor.velocity_closedloop(target_velocity, current_angle, now_us);
+
+        //Run open loop
+        motor.velocity_openloop(target_velocity, now_us);
 
         // Debug output every ~1000 loops
         debug_counter += 1;
@@ -474,13 +533,14 @@ fn main() -> ! {
             let rms_a = current_sensor.get_rms_a();
             let rms_b = current_sensor.get_rms_b();
             info!(
-                "vel: {}, V: {}, Ia_rms: {}A, Ib_rms: {}A, hz: {}",
-                motor.shaft_velocity, motor.last_voltage, rms_a, rms_b, loop_rate_hz
+                "angle: {} vel: {}, V: {}, hz: {}",
+                current_angle, motor.shaft_velocity, motor.last_voltage, loop_rate_hz
             );
             loop_counter = 0;
             last_debug_time = now_us;
         }
     }
+    END OF COMMENTED CODE */
 }
 
 fn read_angle<T: I2c>(i2c: &mut T) -> Result<f32, T::Error> {
