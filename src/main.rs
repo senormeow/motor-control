@@ -36,9 +36,15 @@ use hal::{
 use hal::fugit::RateExtU32;
 
 //const TOP_VALUE: u16 = 4095;
-const TOP_VALUE: u16 = 4096 * 4 - 1;
-// Deadtime in PWM ticks (e.g., 100 ticks ~ 0.8us at 125MHz system clock with divider 1)
+const TOP_VALUE: u16 = 8191; // 13-bit resolution for finer control (adjust as needed)
+                             // Deadtime in PWM ticks (e.g., 100 ticks ~ 0.8us at 125MHz system clock with divider 1)
 const DEADTIME_TICKS: u16 = 200;
+
+// V/f curve constants for Nissan EM57 at 30V bus
+// Derived from empirical data: Vlim ≈ VF_SLOPE * velocity + VF_OFFSET
+// Fits measured points from 8.9–44.5 rad/s within ~1%
+const VF_SLOPE: f32 = 0.0201; // duty-cycle per rad/s
+const VF_OFFSET: f32 = 0.016; // minimum duty-cycle at zero speed
 
 /// Motor controller struct that encapsulates all 6 PWM channels for 3-phase motor control
 pub struct Motor<A, B, C, An, Bn, Cn>
@@ -312,6 +318,12 @@ fn normalize_angle(angle: f32) -> f32 {
     a
 }
 
+/// Compute voltage limit from V/f curve for a given velocity
+/// Returns duty-cycle (0.0–1.0) based on the empirical Nissan EM57 V/f relationship
+fn velocity_to_voltage(velocity: f32) -> f32 {
+    (VF_SLOPE * velocity.abs() + VF_OFFSET).clamp(0.0, 1.0)
+}
+
 #[entry]
 fn _start() -> ! {
     main()
@@ -422,19 +434,61 @@ fn main() -> ! {
     let mut loop_counter: u32 = 0;
     let mut last_debug_time: u64 = 0;
 
+    // ADC smoothing state (exponential moving average)
+    let mut filtered_vel_adc: f32 = 0.0;
+    let mut filtered_trim_adc: f32 = 0.0;
+    let mut adc_initialized = false;
+    const ADC_ALPHA: f32 = 0.02; // Low-pass filter coefficient (lower = smoother)
+
+    // Velocity ramp rate limit (rad/s per second)
+    let mut ramped_velocity: f32 = 0.0;
+    const VELOCITY_RAMP_RATE: f32 = 20.0; // max change of 20 rad/s per second
+    let mut ramp_timestamp: u64 = 0;
+
     // Closed-loop velocity control
     loop {
         let now_us = timer.get_counter().ticks();
         loop_counter += 1;
 
-        // Read potentiometers via ADC (12-bit: 0-4095)
-        let pot_vel: u16 = adc.read(&mut adc_pin_0).unwrap();
-        let pot_volt: u16 = adc.read(&mut adc_pin_1).unwrap();
+        // Read potentiometers via ADC (12-bit: 0-4095) with smoothing
+        let raw_vel: u16 = adc.read(&mut adc_pin_0).unwrap();
+        let raw_trim: u16 = adc.read(&mut adc_pin_1).unwrap();
 
-        // Scale velocity pot to 0..50 rad/s
-        let target_velocity: f32 = (pot_vel as f32 / 4095.0) * 50.0;
-        // Scale voltage pot to 0..1
-        motor.voltage_limit = pot_volt as f32 / 4095.0;
+        // Initialize filter on first read, then apply exponential moving average
+        if !adc_initialized {
+            filtered_vel_adc = raw_vel as f32;
+            filtered_trim_adc = raw_trim as f32;
+            adc_initialized = true;
+            ramp_timestamp = now_us;
+        } else {
+            filtered_vel_adc += ADC_ALPHA * (raw_vel as f32 - filtered_vel_adc);
+            filtered_trim_adc += ADC_ALPHA * (raw_trim as f32 - filtered_trim_adc);
+        }
+
+        // Pot 0: target velocity 0..50 rad/s (from filtered ADC)
+        let target_velocity: f32 = (filtered_vel_adc / 4095.0) * 50.0;
+
+        // Pot 1: V/f trim factor (center = 1.0, range 0.9..1.1)
+        let vf_trim: f32 = 0.9 + (filtered_trim_adc / 4095.0) * 0.2;
+
+        // Ramp rate limit: smoothly transition to target velocity
+        let ramp_dt_us = now_us.wrapping_sub(ramp_timestamp);
+        let ramp_dt = ramp_dt_us as f32 * 1e-6;
+        if ramp_dt > 0.0 && ramp_dt < 0.5 {
+            let max_change = VELOCITY_RAMP_RATE * ramp_dt;
+            let vel_diff = target_velocity - ramped_velocity;
+            if vel_diff > max_change {
+                ramped_velocity += max_change;
+            } else if vel_diff < -max_change {
+                ramped_velocity -= max_change;
+            } else {
+                ramped_velocity = target_velocity;
+            }
+        }
+        ramp_timestamp = now_us;
+
+        // Compute voltage limit from V/f curve using ramped velocity × trim
+        motor.voltage_limit = (velocity_to_voltage(ramped_velocity) * vf_trim).clamp(0.0, 1.0);
 
         // Read encoder every loop
         // match read_angle(&mut i2c) {
@@ -447,8 +501,8 @@ fn main() -> ! {
         // Read current sensors
 
         // Run closed-loop velocity control
-        //motor.velocity_closedloop(target_velocity, current_angle, now_us);
-        motor.velocity_openloop(target_velocity, now_us);
+        //motor.velocity_closedloop(ramped_velocity, current_angle, now_us);
+        motor.velocity_openloop(ramped_velocity, now_us);
 
         // Debug output every ~1000 loops
         debug_counter += 1;
@@ -460,12 +514,8 @@ fn main() -> ! {
 
             let loop_rate_hz = (loop_counter as f32) / elapsed_s;
             info!(
-                "target_vel: {}, vlim: {}, vel: {}, V: {}, hz: {}",
-                target_velocity,
-                motor.voltage_limit,
-                motor.shaft_velocity,
-                motor.last_voltage,
-                loop_rate_hz
+                "pot: {}, ramp: {}, vlim: {}, trim: {}, hz: {}",
+                target_velocity, ramped_velocity, motor.voltage_limit, vf_trim, loop_rate_hz
             );
             loop_counter = 0;
             last_debug_time = now_us;
