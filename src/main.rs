@@ -16,6 +16,9 @@ use libm::sinf;
 
 use panic_probe as _;
 
+// Bring the embedded-hal 0.2 OneShot trait into scope (rp2040-hal expects this).
+use cortex_m::prelude::_embedded_hal_adc_OneShot;
+
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use rp_pico as bsp;
@@ -32,14 +35,10 @@ use hal::{
 
 use hal::fugit::RateExtU32;
 
-mod current_sensor;
-
-use current_sensor::CurrentSensor;
-
 //const TOP_VALUE: u16 = 4095;
-const TOP_VALUE: u16 = 4094 - 1;
+const TOP_VALUE: u16 = 4096 * 4 - 1;
 // Deadtime in PWM ticks (e.g., 100 ticks ~ 0.8us at 125MHz system clock with divider 1)
-const DEADTIME_TICKS: u16 = 100;
+const DEADTIME_TICKS: u16 = 200;
 
 /// Motor controller struct that encapsulates all 6 PWM channels for 3-phase motor control
 pub struct Motor<A, B, C, An, Bn, Cn>
@@ -354,11 +353,9 @@ fn main() -> ! {
     enable.set_low().unwrap();
 
     //Setup ADC
-    let adc = hal::Adc::new(pac.ADC, &mut pac.RESETS);
-    let adc_pin_0 = hal::adc::AdcPin::new(pins.gpio26).unwrap();
-    let adc_pin_1 = hal::adc::AdcPin::new(pins.gpio27).unwrap();
-
-    let mut current_sensor = CurrentSensor::new(adc, adc_pin_0, adc_pin_1);
+    let mut adc = hal::Adc::new(pac.ADC, &mut pac.RESETS);
+    let mut adc_pin_0 = hal::adc::AdcPin::new(pins.gpio26).unwrap();
+    let mut adc_pin_1 = hal::adc::AdcPin::new(pins.gpio27).unwrap();
 
     //Setup PWM
 
@@ -395,8 +392,8 @@ fn main() -> ! {
         &mut pwm_a.channel_b,
         &mut pwm_b.channel_b,
         &mut pwm_c.channel_b,
-        7,    // pole_pairs (adjust for your motor)
-        1.0,  // voltage_limit (0.0-1.0) - max power
+        4,    // pole_pairs (adjust for your motor)
+        0.5,  // voltage_limit (0.0-1.0) - max power
         0.08, // velocity_p (proportional gain)
         0.02, // velocity_i (integral gain)
     );
@@ -420,8 +417,6 @@ fn main() -> ! {
     enable.set_high().unwrap();
 
     info!("Running");
-    let target_velocity: f32 = 40.0;
-
     let mut current_angle: f32 = 0.0;
     let mut debug_counter: u32 = 0;
     let mut loop_counter: u32 = 0;
@@ -432,37 +427,45 @@ fn main() -> ! {
         let now_us = timer.get_counter().ticks();
         loop_counter += 1;
 
+        // Read potentiometers via ADC (12-bit: 0-4095)
+        let pot_vel: u16 = adc.read(&mut adc_pin_0).unwrap();
+        let pot_volt: u16 = adc.read(&mut adc_pin_1).unwrap();
+
+        // Scale velocity pot to 0..50 rad/s
+        let target_velocity: f32 = (pot_vel as f32 / 4095.0) * 50.0;
+        // Scale voltage pot to 0..1
+        motor.voltage_limit = pot_volt as f32 / 4095.0;
+
         // Read encoder every loop
-        match read_angle(&mut i2c) {
-            Ok(angle) => {
-                current_angle = angle;
-            }
-            Err(_) => {}
-        }
+        // match read_angle(&mut i2c) {
+        //     Ok(angle) => {
+        //         current_angle = angle;
+        //     }
+        //     Err(_) => {}
+        // }
 
         // Read current sensors
-        current_sensor.read();
 
         // Run closed-loop velocity control
-        motor.velocity_closedloop(target_velocity, current_angle, now_us);
+        //motor.velocity_closedloop(target_velocity, current_angle, now_us);
+        motor.velocity_openloop(target_velocity, now_us);
 
         // Debug output every ~1000 loops
         debug_counter += 1;
         if debug_counter >= 1000 {
             debug_counter = 0;
 
-            // Calculate RMS current from accumulated samples
-            current_sensor.calculate_rms();
-
             let elapsed_us = now_us.wrapping_sub(last_debug_time);
             let elapsed_s = elapsed_us as f32 * 1e-6;
 
             let loop_rate_hz = (loop_counter as f32) / elapsed_s;
-            let rms_a = current_sensor.get_rms_a();
-            let rms_b = current_sensor.get_rms_b();
             info!(
-                "vel: {}, V: {}, Ia_rms: {}A, Ib_rms: {}A, hz: {}",
-                motor.shaft_velocity, motor.last_voltage, rms_a, rms_b, loop_rate_hz
+                "target_vel: {}, vlim: {}, vel: {}, V: {}, hz: {}",
+                target_velocity,
+                motor.voltage_limit,
+                motor.shaft_velocity,
+                motor.last_voltage,
+                loop_rate_hz
             );
             loop_counter = 0;
             last_debug_time = now_us;
